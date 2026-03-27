@@ -264,7 +264,7 @@ input[type=range]::-moz-range-thumb{
       </div>
     </div>
     <div class="dedication">
-      Developed for <strong>Dr. Hubertina Reina</strong>
+      Developed for <strong>Dr. XXXXX XXXX</strong>
     </div>
   </div>
 
@@ -317,10 +317,18 @@ input[type=range]::-moz-range-thumb{
 
         <div class="ctrl-group">
           <div class="ctrl-header">
-            <label>Radius</label>
-            <span class="val" id="radius-val">0.8 cm</span>
+            <label>Paint Radius</label>
+            <span class="val" id="radius-val">0.4 cm</span>
           </div>
-          <input type="range" id="radius" min="1" max="30" value="8"/>
+          <input type="range" id="radius" min="1" max="30" value="4"/>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-header">
+            <label>Lesion Size</label>
+            <span class="val" id="lesion-size-val">0.1 cm</span>
+          </div>
+          <input type="range" id="lesion-size" min="1" max="20" value="1"/>
         </div>
 
         <div class="ctrl-group">
@@ -356,9 +364,9 @@ input[type=range]::-moz-range-thumb{
         <div class="ctrl-group">
           <div class="ctrl-header">
             <label>Redness</label>
-            <span class="val" id="darkness-val">0%</span>
+            <span class="val" id="darkness-val">80%</span>
           </div>
-          <input type="range" id="darkness" min="0" max="90" value="0"/>
+          <input type="range" id="darkness" min="0" max="90" value="80"/>
         </div>
 
         <div class="ctrl-group">
@@ -411,9 +419,10 @@ input[type=range]::-moz-range-thumb{
   <div id="footer">
     <span>
       3D model: <strong>uterus.glb</strong> —
-      free model from <a href="https://sketchfab.com/tags/uterus" target="_blank">Sketchfab</a>
+      free models at <a href="https://sketchfab.com/tags/uterus" target="_blank">Sketchfab</a>
+      and <a href="https://github.com/Kevin-Mattheus-Moerman/BodyParts3D" target="_blank">BodyParts3D (CC BY-SA)</a>
     </span>
-    <span>Made for <strong style="color:var(--teal)">Dr. Hubertina Reina</strong> · Educational use only</span>
+    <span>Made for <strong style="color:var(--teal)">Dr. XXXXX XXXX</strong> · Educational use only</span>
   </div>
 </div>
 
@@ -427,10 +436,11 @@ input[type=range]::-moz-range-thumb{
 const S = {
   lesionLog:   [],
   lesionColor: [80, 20, 10],
-  radius:      0.2,
+  radius:      0.4,
   intensity:   0.85,
   opacity:     1.0,
-  darkness:    0.75,   // 0 = original colour, 1 = fully black
+  darkness:    0.8,
+  lesionSize:  0.1,   // radius of the 3D ellipsoid blob placed on surface
 };
 
 // ── Three globals ──────────────────────────────────────────────
@@ -498,7 +508,67 @@ function darken(v, d, channel){
   return v * (1 - d * 0.7);                                      // G,B: pull down
 }
 
-// Re-apply current darkness to all registered meshes
+// ── 3D Lesion blobs ────────────────────────────────────────────
+// Each placed lesion = a small ellipsoid Three.Mesh added to the scene.
+// We track them separately so undo/reset can remove them.
+const lesionBlobs = [];   // parallel to S.lesionLog — one blob per lesion
+
+function makeLesionBlob(worldPt, normal, color){
+  const[r,g,b] = color.map(v=>v/255);
+
+  // Ellipsoid: scale a sphere (flat in the normal direction = "pancake")
+  const sz = S.lesionSize;
+  const geo = new THREE.SphereGeometry(1, 16, 10);
+
+  // Flatten along normal axis to look like a surface deposit
+  // (thin in normal direction, full radius in tangent plane)
+  const scaleN   = sz * 0.35;   // height above surface
+  const scaleTan = sz * 0.9;    // width along surface
+
+  // Build a local frame: normal is Y, two tangents are X/Z
+  const N = normal.clone().normalize();
+  const up = Math.abs(N.y) < 0.9
+    ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
+  const T1 = new THREE.Vector3().crossVectors(N, up).normalize();
+  const T2 = new THREE.Vector3().crossVectors(N, T1).normalize();
+
+  // Rotation matrix: columns are T1, N, T2
+  const m = new THREE.Matrix4().makeBasis(T1, N, T2);
+
+  const mat = new THREE.MeshPhongMaterial({
+    color: new THREE.Color(r,g,b),
+    shininess: 80,
+    specular: new THREE.Color(0.4, 0.2, 0.2),
+    transparent: true,
+    opacity: 0.92,
+  });
+
+  const blob = new THREE.Mesh(geo, mat);
+
+  // Offset the sphere so it sits on the surface (half radius above)
+  const offset = worldPt.clone().add(N.clone().multiplyScalar(sz * 0.5));
+  blob.position.copy(offset);
+  // No rotation needed — uniform sphere
+  blob.scale.set(sz, sz, sz);
+
+  scene.add(blob);
+  lesionBlobs.push(blob);
+  return blob;
+}
+
+function removeLastBlob(){
+  const blob = lesionBlobs.pop();
+  if(blob){ scene.remove(blob); blob.geometry.dispose(); blob.material.dispose(); }
+}
+
+function removeAllBlobs(){
+  while(lesionBlobs.length){
+    const blob = lesionBlobs.pop();
+    scene.remove(blob); blob.geometry.dispose(); blob.material.dispose();
+  }
+}
+
+// ── Re-apply current darkness to all registered meshes ─────────
 function applyDarknessAll(){
   Object.entries(meshObjects).forEach(([key, mesh])=>{
     const col = meshColors[key];
@@ -626,6 +696,36 @@ function paint(mesh,pt){
   }
   if(!hi.length) return;
   geo.attributes.color.needsUpdate=true;
+
+  // Place a 3D ellipsoid blob on the surface at the click point
+  const faceNormal = new THREE.Vector3();
+  const normalAttr = geo.attributes.normal;
+  if(normalAttr){
+    // Average normals of nearby hit vertices to get a stable surface normal
+    let nx=0,ny=0,nz=0, cnt=0;
+    hi.forEach(i=>{
+      const wp = new THREE.Vector3(
+        geo.attributes.position.array[i*3],
+        geo.attributes.position.array[i*3+1],
+        geo.attributes.position.array[i*3+2]
+      ).applyMatrix4(mesh.matrixWorld);
+      const d2 = wp.distanceToSquared(pt);
+      if(d2 < (S.radius*0.3)**2){
+        nx+=normalAttr.array[i*3];
+        ny+=normalAttr.array[i*3+1];
+        nz+=normalAttr.array[i*3+2];
+        cnt++;
+      }
+    });
+    if(cnt>0) faceNormal.set(nx/cnt,ny/cnt,nz/cnt);
+    else faceNormal.set(0,1,0);
+    // Transform normal from local to world space (no translation, only rotation)
+    faceNormal.transformDirection(mesh.matrixWorld).normalize();
+  } else {
+    faceNormal.set(0,1,0);
+  }
+
+  makeLesionBlob(pt, faceNormal, S.lesionColor);
   S.lesionLog.push({key,indices:hi,oldColors:oc});
   updateStats();
 }
@@ -637,6 +737,7 @@ function undo(){
   const col=meshColors[key];
   indices.forEach((vi,i)=>{col[vi*3]=oldColors[i*3];col[vi*3+1]=oldColors[i*3+1];col[vi*3+2]=oldColors[i*3+2]});
   meshObjects[key].geometry.attributes.color.needsUpdate=true;
+  removeLastBlob();
   updateStats();
 }
 function resetLesions(){
@@ -651,7 +752,7 @@ function resetLesions(){
     }
     mesh.geometry.attributes.color.needsUpdate=true;
   });
-  S.lesionLog=[]; updateStats();
+  S.lesionLog=[]; removeAllBlobs(); updateStats();
 }
 function updateStats(){
   $('stat-count').textContent=S.lesionLog.length;
@@ -728,6 +829,10 @@ function wireUI(){
   $('radius').addEventListener('input',function(){
     S.radius=this.value/10;
     $('radius-val').textContent=S.radius.toFixed(1)+' cm';
+  });
+  $('lesion-size').addEventListener('input',function(){
+    S.lesionSize=this.value/10;
+    $('lesion-size-val').textContent=S.lesionSize.toFixed(1)+' cm';
   });
   $('intensity').addEventListener('input',function(){
     S.intensity=this.value/100;
